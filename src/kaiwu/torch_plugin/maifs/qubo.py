@@ -1,17 +1,20 @@
+"""QUBO and Ising helpers for MAIFS feature selection."""
+
 from __future__ import annotations
 
-# pylint: disable=too-many-lines,import-outside-toplevel
-
 import hashlib
+import importlib
 import shutil
 import tempfile
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
 from time import time_ns
-from typing import Any, cast
-import kaiwu as kw
+from typing import Any, Callable, cast
+
 import numpy as np
+
+import kaiwu as kw
 
 AVAILABLE_SOLVERS = (
     "local_search",
@@ -23,7 +26,32 @@ DEFAULT_CIM_TARGET_PRECISION = 14
 DEFAULT_CIM_MAX_BITS = 1000
 DEFAULT_CIM_MAX_PRECISION = 32
 DEFAULT_CIM_PRECISION_STEP = 4
-DEFAULT_CIM_SAMPLE_NUMBER = 512
+DEFAULT_CIM_SAMPLE_NUMBER = 1
+DEFAULT_CIM_TASK_MODE = "quota"
+
+
+def _get_kaiwu_precision_helpers() -> tuple[Any, Any]:
+    """Return Kaiwu precision helpers from the available module path."""
+    for module_name in ("kaiwu.preprocess", "kaiwu.ising"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        adjust_precision = getattr(module, "adjust_ising_matrix_precision", None)
+        calculate_bit_width = getattr(
+            module,
+            "calculate_ising_matrix_bit_width",
+            None,
+        )
+        if adjust_precision is not None and calculate_bit_width is not None:
+            return adjust_precision, calculate_bit_width
+    raise ImportError("Kaiwu precision helpers are unavailable.")
+
+
+def _get_kaiwu_split_helper() -> Any:
+    """Return the Kaiwu precision-adaption split helper."""
+    preprocess_module = importlib.import_module("kaiwu.preprocess")
+    return getattr(preprocess_module, "perform_precision_adaption_split")
 
 
 @dataclass
@@ -181,17 +209,9 @@ class PrecisionSplitExplorer:
         Raises:
             ImportError: If the Kaiwu precision helpers are unavailable.
         """
-        try:
-            from kaiwu.preprocess import (
-                adjust_ising_matrix_precision,
-                calculate_ising_matrix_bit_width,
-            )
-        except ImportError:
-            from kaiwu.ising import (
-                adjust_ising_matrix_precision,
-                calculate_ising_matrix_bit_width,
-            )
-
+        adjust_ising_matrix_precision, calculate_ising_matrix_bit_width = (
+            _get_kaiwu_precision_helpers()
+        )
         precision_info = calculate_ising_matrix_bit_width(ising_matrix, precision)
         if precision_info.get("multiplier") != float("inf"):
             adjusted_matrix = ising_matrix * precision_info.get("multiplier")
@@ -217,8 +237,7 @@ class PrecisionSplitExplorer:
         Raises:
             ImportError: If the Kaiwu splitting helper is unavailable.
         """
-        from kaiwu.preprocess import perform_precision_adaption_split
-
+        perform_precision_adaption_split = _get_kaiwu_split_helper()
         adjusted_matrix, precision_info = self._adjust_to_precision(
             ising_matrix,
             source_precision,
@@ -369,25 +388,37 @@ class PrecisionSplitExplorer:
             ValueError: If ``search`` has not been called.
             ImportError: If the Kaiwu restoration helper is unavailable.
         """
-        try:
-            from kaiwu.preprocess import restore_splitted_solution
-
-            if self.plan is None:
-                raise ValueError("search or fit must be called before restoring")
-            return restore_splitted_solution(solution, self.plan.last_var_idx, vote)
-        except ImportError:
-            from kaiwu.preprocess import restore_split_solution
-
         if self.plan is None:
             raise ValueError("search or fit must be called before restoring")
-        return restore_split_solution(solution, self.plan.last_var_idx)
+        return _restore_kaiwu_split_solution(solution, self.plan.last_var_idx, vote)
 
 
-class QuadraticLinearSolver:  # pylint: disable=too-few-public-methods
+def _restore_kaiwu_split_solution(
+    solution: np.ndarray,
+    last_var_idx: Any,
+    vote: bool,
+) -> np.ndarray:
+    """Restore a split Kaiwu solution across supported Kaiwu versions."""
+    preprocess_module = importlib.import_module("kaiwu.preprocess")
+    restore_with_vote = cast(
+        Callable[[np.ndarray, Any, bool], np.ndarray] | None,
+        getattr(preprocess_module, "restore_splitted_solution", None),
+    )
+    if restore_with_vote is not None:
+        return restore_with_vote(solution, last_var_idx, vote)
+
+    restore_without_vote = cast(
+        Callable[[np.ndarray, Any], np.ndarray],
+        getattr(preprocess_module, "restore_split_solution"),
+    )
+    return restore_without_vote(solution, last_var_idx)
+
+
+class QuadraticLinearSolver:
     """Convert QUBO quadratic and linear terms to an Ising matrix."""
 
     @staticmethod
-    def _qubo_matrix_to_ising_matrix(qubo_matrix: np.ndarray) -> np.ndarray:
+    def qubo_matrix_to_ising_matrix(qubo_matrix: np.ndarray) -> np.ndarray:
         """Convert an upper-triangular QUBO matrix to an auxiliary-spin Ising matrix.
 
         Args:
@@ -434,9 +465,37 @@ class QuadraticLinearSolver:  # pylint: disable=too-few-public-methods
 
         Returns:
             Ising matrix with one auxiliary spin appended.
+
+        Raises:
+            ValueError: If terms have incompatible shapes or non-finite values.
         """
-        qubo_matrix = _qubo_terms_to_matrix(quadratic_matrix, linear_vector)
-        return self._qubo_matrix_to_ising_matrix(qubo_matrix)
+        quadratic_matrix = np.asarray(quadratic_matrix, dtype=float)
+        linear_vector = np.asarray(linear_vector, dtype=float)
+        if quadratic_matrix.ndim != 2 or (
+            quadratic_matrix.shape[0] != quadratic_matrix.shape[1]
+        ):
+            raise ValueError("quadratic_matrix must be a square matrix")
+        if (
+            linear_vector.ndim != 1
+            or linear_vector.shape[0] != quadratic_matrix.shape[0]
+        ):
+            raise ValueError(
+                "linear_vector must be a vector with length matching quadratic_matrix"
+            )
+        if not np.all(np.isfinite(quadratic_matrix)) or not np.all(
+            np.isfinite(linear_vector)
+        ):
+            raise ValueError(
+                "quadratic_matrix and linear_vector must contain only finite values"
+            )
+
+        symmetric_quadratic = 0.5 * (quadratic_matrix + quadratic_matrix.T)
+        qubo_matrix = np.triu(symmetric_quadratic, 1)
+        np.fill_diagonal(
+            qubo_matrix,
+            linear_vector + 0.5 * np.diag(symmetric_quadratic),
+        )
+        return self.qubo_matrix_to_ising_matrix(qubo_matrix)
 
 
 def _solve_ising_local_search(
@@ -515,72 +574,58 @@ def _solve_ising_sa(
     initial_binary: np.ndarray | None = None,
     max_iter: int = 2000,
     random_state: int = 0,
+    **optimizer_kwargs: object,
 ) -> np.ndarray:
-    """Solve an Ising matrix with local simulated annealing.
+    """Solve an Ising matrix with Kaiwu classical simulated annealing.
 
     Args:
         ising_matrix: Square Ising matrix with an auxiliary spin.
         initial_binary: Optional initial binary state for the original QUBO
-            variables.
-        max_iter: Maximum number of annealing steps.
-        random_state: Seed for the NumPy random number generator.
+            variables. Kaiwu SA does not consume this state directly, but it is
+            validated to keep the solver contract consistent.
+        max_iter: Backward-compatible positive iteration hint from the previous
+            local SA solver. Kaiwu-specific schedule options should be passed
+            through ``optimizer_kwargs``.
+        random_state: Seed applied to NumPy before invoking Kaiwu SA.
+        **optimizer_kwargs: Keyword arguments passed to
+            ``kw.classical.SimulatedAnnealingOptimizer``.
 
     Returns:
         One or more spin solutions encoded as ``-1`` and ``1`` values.
 
     Raises:
         ValueError: If input shapes or values are invalid.
+        RuntimeError: If Kaiwu SA does not return a solution.
     """
     if max_iter < 1:
         raise ValueError("max_iter must be a positive integer")
-    rng = np.random.default_rng(int(random_state))
     matrix = np.asarray(ising_matrix, dtype=float)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         raise ValueError("ising_matrix must be a square matrix")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("ising_matrix must contain only finite values")
 
-    if initial_binary is None:
-        spins = np.ones(matrix.shape[0], dtype=int)
-    else:
+    if initial_binary is not None:
         binary = np.asarray(initial_binary, dtype=int)
         if binary.ndim != 1 or binary.shape[0] != matrix.shape[0] - 1:
             raise ValueError("initial_binary must match the QUBO variable size")
         if not np.all((binary == 0) | (binary == 1)):
             raise ValueError("initial_binary must contain only 0/1 values")
-        spins = np.r_[2 * binary - 1, 1].astype(int)
 
-    weights = np.triu(matrix)
+    resolved_kwargs = {"size_limit": 1}
+    resolved_kwargs.update(optimizer_kwargs)
+    optimizer = kw.classical.SimulatedAnnealingOptimizer(**resolved_kwargs)
 
-    def objective(candidate: np.ndarray) -> float:
-        """Evaluate the Ising objective for a candidate spin vector.
+    random_state_snapshot = np.random.get_state()
+    try:
+        np.random.seed(int(random_state))
+        result = optimizer.solve(matrix)
+    finally:
+        np.random.set_state(random_state_snapshot)
 
-        Args:
-            candidate: Candidate spin vector encoded with ``-1`` and ``1``.
-
-        Returns:
-            Ising objective value for ``candidate``.
-        """
-        return float(np.sum(weights * np.outer(candidate, candidate)))
-
-    current_value = objective(spins)
-    best_spins = spins.copy()
-    best_value = current_value
-
-    for step in range(int(max_iter)):
-        index = int(rng.integers(spins.size))
-        candidate = spins.copy()
-        candidate[index] *= -1
-        candidate_value = objective(candidate)
-        delta = candidate_value - current_value
-        temperature = max(1e-6, 1.0 * (0.995**step))
-
-        if delta <= 0.0 or rng.random() < float(np.exp(-delta / temperature)):
-            spins = candidate
-            current_value = float(candidate_value)
-            if current_value < best_value:
-                best_value = current_value
-                best_spins = spins.copy()
-
-    return best_spins.reshape(1, -1).astype(int)
+    if result is None:
+        raise RuntimeError("SimulatedAnnealingOptimizer did not return a solution.")
+    return np.asarray(result, dtype=int)
 
 
 def _solve_ising_kaiwu_cim(
@@ -593,7 +638,7 @@ def _solve_ising_kaiwu_cim(
     save_dir: str | Path | None = None,
     cleanup_records: bool = True,
     project_no: str | None = None,
-    task_mode: Any = "sample",
+    task_mode: Any = DEFAULT_CIM_TASK_MODE,
     interval: int | None = None,
 ) -> np.ndarray:
     """Split Ising precision and solve directly with Kaiwu CIMOptimizer.
@@ -604,7 +649,7 @@ def _solve_ising_kaiwu_cim(
         max_bits: Maximum allowed split variable count.
         max_precision: Maximum source precision to test.
         precision_step: Coarse-search precision step.
-        sample_number: Number of solutions requested from Kaiwu CIM.
+        sample_number: Requested solution count for Kaiwu CIM.
         save_dir: Optional directory used by Kaiwu checkpoint records.
         cleanup_records: Whether to delete generated checkpoint records.
         project_no: Optional Kaiwu project number.
@@ -659,8 +704,10 @@ def _solve_ising_kaiwu_cim(
             raise RuntimeError("CIMOptimizer did not return a solution.")
         result = np.asarray(result)
         result = result.reshape(1, -1) if result.ndim == 1 else result
-        result = result[: int(sample_number)]
-        return np.asarray([explorer.restore_solution(solution) for solution in result])
+        if result.shape[0] == 0:
+            raise RuntimeError("CIMOptimizer returned no solutions.")
+        restored = explorer.restore_solution(result[0])
+        return np.asarray(restored).reshape(1, -1)
     finally:
         if cleanup_records:
             for child in resolved_save_dir.iterdir():
@@ -673,71 +720,98 @@ def _solve_ising_kaiwu_cim(
                         pass
 
 
-def qubo_objective(
-    binary_state: np.ndarray,
-    quadratic_matrix: np.ndarray,
-    linear_vector: np.ndarray,
-) -> float:
-    """Compute a binary QUBO objective value.
-
-    Args:
-        binary_state: Binary candidate vector.
-        quadratic_matrix: QUBO quadratic term.
-        linear_vector: QUBO linear term.
-
-    Returns:
-        Objective value computed from the binary state, quadratic matrix, and
-        linear vector.
-    """
-    return float(
-        0.5 * binary_state @ quadratic_matrix @ binary_state
-        + linear_vector @ binary_state
-    )
+def _optional_int(value: object) -> int | None:
+    """Convert optional solver values to integers."""
+    if value is None:
+        return None
+    return int(value)
 
 
-def _qubo_terms_to_matrix(
-    quadratic_matrix: np.ndarray,
-    linear_vector: np.ndarray,
+def _solve_ising_kaiwu_backend(
+    ising_matrix: np.ndarray,
+    solver_kwargs: dict[str, object],
 ) -> np.ndarray:
-    """Convert QUBO quadratic and linear terms to upper-triangular form.
-
-    Args:
-        quadratic_matrix: QUBO quadratic term.
-        linear_vector: QUBO linear term.
-
-    Returns:
-        Upper-triangular QUBO matrix.
-
-    Raises:
-        ValueError: If terms have incompatible shapes or non-finite values.
-    """
-    quadratic_matrix = np.asarray(quadratic_matrix, dtype=float)
-    linear_vector = np.asarray(linear_vector, dtype=float)
-    if quadratic_matrix.ndim != 2 or (
-        quadratic_matrix.shape[0] != quadratic_matrix.shape[1]
-    ):
-        raise ValueError("quadratic_matrix must be a square matrix")
-    if (
-        linear_vector.ndim != 1
-        or linear_vector.shape[0] != quadratic_matrix.shape[0]
-    ):
-        raise ValueError(
-            "linear_vector must be a vector with length matching quadratic_matrix"
-        )
-    if not np.all(np.isfinite(quadratic_matrix)) or not np.all(
-        np.isfinite(linear_vector)
-    ):
-        raise ValueError(
-            "quadratic_matrix and linear_vector must contain only finite values"
-        )
-
-    symmetric_quadratic = 0.5 * (quadratic_matrix + quadratic_matrix.T)
-    qubo_matrix = np.triu(symmetric_quadratic, 1)
-    np.fill_diagonal(
-        qubo_matrix,
-        linear_vector + 0.5 * np.diag(symmetric_quadratic),
+    """Solve an Ising matrix with the Kaiwu CIM backend."""
+    max_bits = solver_kwargs.get("max_bits", DEFAULT_CIM_MAX_BITS)
+    return _solve_ising_kaiwu_cim(
+        ising_matrix,
+        target_precision=int(
+            solver_kwargs.get(
+                "target_precision",
+                DEFAULT_CIM_TARGET_PRECISION,
+            )
+        ),
+        max_bits=_optional_int(max_bits),
+        max_precision=int(
+            solver_kwargs.get("max_precision", DEFAULT_CIM_MAX_PRECISION)
+        ),
+        precision_step=int(
+            solver_kwargs.get("precision_step", DEFAULT_CIM_PRECISION_STEP)
+        ),
+        sample_number=int(
+            solver_kwargs.get("sample_number", DEFAULT_CIM_SAMPLE_NUMBER)
+        ),
+        save_dir=cast(str | Path | None, solver_kwargs.get("save_dir", None)),
+        cleanup_records=bool(solver_kwargs.get("cleanup_records", True)),
+        project_no=cast(str | None, solver_kwargs.get("project_no", None)),
+        task_mode=solver_kwargs.get("task_mode", DEFAULT_CIM_TASK_MODE),
+        interval=cast(int | None, solver_kwargs.get("interval", None)),
     )
-    return qubo_matrix
+
+
+def _solve_ising_with_backend(
+    solver_name: str,
+    ising_matrix: np.ndarray,
+    initial_state: np.ndarray,
+    solver_kwargs: dict[str, object],
+) -> np.ndarray:
+    """Dispatch an Ising matrix to the selected solver backend."""
+    if solver_name == "local_search":
+        return _solve_ising_local_search(
+            ising_matrix,
+            initial_binary=initial_state,
+            max_iter=int(solver_kwargs.get("max_iter", 2000)),
+        )
+    if solver_name == "sa":
+        sa_kwargs = dict(solver_kwargs)
+        max_iter = int(sa_kwargs.pop("max_iter", 2000))
+        random_state = int(sa_kwargs.pop("random_state", 0))
+        return _solve_ising_sa(
+            ising_matrix,
+            initial_binary=initial_state,
+            max_iter=max_iter,
+            random_state=random_state,
+            **sa_kwargs,
+        )
+    if solver_name == "kaiwu_cim":
+        return _solve_ising_kaiwu_backend(ising_matrix, solver_kwargs)
+
+    choices = ", ".join(AVAILABLE_SOLVERS)
+    raise ValueError(f"Unsupported solver {solver_name!r}. Available solvers: {choices}")
+
+
+def _binary_from_solver_solution(
+    spin_solutions: np.ndarray,
+    num_variables: int,
+) -> np.ndarray:
+    """Convert the first auxiliary-spin solver solution to a binary QUBO state."""
+    spin_array = np.asarray(spin_solutions, dtype=float)
+    if spin_array.ndim == 2:
+        if spin_array.shape[0] == 0:
+            raise RuntimeError("solver must return at least one spin solution")
+        spin_solution = spin_array[0]
+    elif spin_array.ndim == 1:
+        spin_solution = spin_array
+    else:
+        raise RuntimeError("solver must return a one- or two-dimensional array")
+
+    if spin_solution.shape != (num_variables + 1,):
+        raise RuntimeError("spin solution must contain one auxiliary spin")
+    if not np.all((spin_solution == -1) | (spin_solution == 1)):
+        raise RuntimeError("spin solution must contain only -1/1 values")
+
+    binary = np.rint((spin_solution[:-1] * spin_solution[-1] + 1.0) / 2.0)
+    return binary.astype(int)
 
 
 def solve_qubo(
@@ -747,8 +821,7 @@ def solve_qubo(
     solver: str = "local_search",
     **solver_kwargs: object,
 ) -> np.ndarray:
-    # pylint: disable=too-many-branches,too-many-statements
-    """Validate QUBO inputs and solve them with a built-in solver.
+    """Solve one QUBO problem with a built-in optimization backend.
 
     Args:
         quadratic_matrix: QUBO quadratic term.
@@ -759,119 +832,41 @@ def solve_qubo(
         **solver_kwargs: Solver-specific keyword arguments.
 
     Returns:
-        Best binary state found by the selected solver.
+        Binary state returned by the selected optimization backend.
 
     Raises:
         ValueError: If inputs or the solver name are invalid.
         ImportError: If ``solver="kaiwu_cim"`` is requested without Kaiwu.
         RuntimeError: If solver execution fails or returns an invalid solution.
     """
-    quadratic_matrix = np.asarray(quadratic_matrix, dtype=float)
-    linear_vector = np.asarray(linear_vector, dtype=float)
     initial_state = np.asarray(initial_state, dtype=int)
-    if quadratic_matrix.ndim != 2 or (
-        quadratic_matrix.shape[0] != quadratic_matrix.shape[1]
-    ):
-        raise ValueError("quadratic_matrix must be a square matrix")
-    if linear_vector.shape != (quadratic_matrix.shape[0],):
-        raise ValueError(
-            "linear_vector must have one entry per QUBO variable"
-        )
-    if initial_state.shape != linear_vector.shape:
-        raise ValueError("initial_state must have the same shape as linear_vector")
-    if not np.all(np.isfinite(quadratic_matrix)) or not np.all(
-        np.isfinite(linear_vector)
-    ):
-        raise ValueError(
-            "quadratic_matrix and linear_vector must contain only finite values"
-        )
-    if not np.all((initial_state == 0) | (initial_state == 1)):
-        raise ValueError("initial_state must contain only binary 0/1 values")
-    quadratic_matrix = 0.5 * (quadratic_matrix + quadratic_matrix.T)
-
     solver_name = str(solver)
-    if solver_name not in AVAILABLE_SOLVERS:
-        choices = ", ".join(AVAILABLE_SOLVERS)
-        raise ValueError(
-            f"Unsupported solver {solver_name!r}. Available solvers: {choices}"
-        )
 
     try:
         ising_matrix = QuadraticLinearSolver().solve(
             quadratic_matrix,
             linear_vector,
         )
+        if initial_state.shape != (ising_matrix.shape[0] - 1,):
+            raise ValueError("initial_state must match the QUBO variable size")
+        if not np.all((initial_state == 0) | (initial_state == 1)):
+            raise ValueError("initial_state must contain only binary 0/1 values")
 
-        if solver_name == "local_search":
-            spin_solutions = _solve_ising_local_search(
-                ising_matrix,
-                initial_binary=initial_state,
-                max_iter=int(solver_kwargs.get("max_iter", 2000)),
-            )
-        elif solver_name == "sa":
-            spin_solutions = _solve_ising_sa(
-                ising_matrix,
-                initial_binary=initial_state,
-                max_iter=int(solver_kwargs.get("max_iter", 2000)),
-                random_state=int(solver_kwargs.get("random_state", 0)),
-            )
-        else:
-            max_bits = solver_kwargs.get("max_bits", DEFAULT_CIM_MAX_BITS)
-            spin_solutions = _solve_ising_kaiwu_cim(
-                ising_matrix,
-                target_precision=int(
-                    solver_kwargs.get(
-                        "target_precision",
-                        DEFAULT_CIM_TARGET_PRECISION,
-                    )
-                ),
-                max_bits=None if max_bits is None else int(max_bits),
-                max_precision=int(
-                    solver_kwargs.get("max_precision", DEFAULT_CIM_MAX_PRECISION)
-                ),
-                precision_step=int(
-                    solver_kwargs.get("precision_step", DEFAULT_CIM_PRECISION_STEP)
-                ),
-                sample_number=int(
-                    solver_kwargs.get("sample_number", DEFAULT_CIM_SAMPLE_NUMBER)
-                ),
-                save_dir=cast(str | Path | None, solver_kwargs.get("save_dir", None)),
-                cleanup_records=bool(solver_kwargs.get("cleanup_records", True)),
-                project_no=cast(str | None, solver_kwargs.get("project_no", None)),
-                task_mode=solver_kwargs.get("task_mode", "sample"),
-                interval=cast(int | None, solver_kwargs.get("interval", None)),
-            )
-    except ImportError:
+        spin_solutions = _solve_ising_with_backend(
+            solver_name,
+            ising_matrix,
+            initial_state,
+            solver_kwargs,
+        )
+    except (ImportError, ValueError):
         raise
     except Exception as exc:
         raise RuntimeError(
             f"MAIFS solver '{solver_name}' failed. "
-            f"Problem shape: quadratic_matrix={quadratic_matrix.shape}, "
-            f"linear_vector={linear_vector.shape}. "
             f"Original error: {type(exc).__name__}: {exc}"
         ) from exc
 
-    result = initial_state.copy()
-    best_value = float("inf")
-    spin_array = np.asarray(spin_solutions)
-    if spin_array.ndim == 1:
-        spin_array = spin_array.reshape(1, -1)
-    for spin_solution in spin_array:
-        spin_solution = np.asarray(spin_solution, dtype=float)
-        if spin_solution.shape != (linear_vector.shape[0] + 1,):
-            raise RuntimeError("spin solution must contain one auxiliary spin")
-        if not np.all((spin_solution == -1) | (spin_solution == 1)):
-            raise RuntimeError("spin solution must contain only -1/1 values")
-        binary = np.rint((spin_solution[:-1] * spin_solution[-1] + 1.0) / 2.0)
-        binary = binary.astype(int)
-        value = qubo_objective(binary, quadratic_matrix, linear_vector)
-        if value < best_value:
-            best_value = value
-            result = binary
-
-    result = np.asarray(result, dtype=int)
-    if result.shape != linear_vector.shape or not np.all((result == 0) | (result == 1)):
-        raise RuntimeError(
-            "MAIFS solver must return a binary vector matching linear_vector."
-        )
-    return result
+    return _binary_from_solver_solution(
+        spin_solutions,
+        initial_state.shape[0],
+    )

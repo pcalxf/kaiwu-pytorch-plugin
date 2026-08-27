@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .qubo import qubo_objective, solve_qubo
+from .qubo import solve_qubo
 
 Batch = tuple[torch.Tensor, torch.Tensor]
 LossFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -93,6 +93,7 @@ class FeatureSelectionWrapper(nn.Module):
         input_feature_axis: int = -1,
         solver_kwargs: dict[str, object] | None = None,
     ) -> None:
+
         super().__init__()
         explicit_min = min_selected_features is not None
         feature_dim = int(feature_dim)
@@ -426,7 +427,10 @@ class FeatureSelectionWrapper(nn.Module):
             """
             changed = projected.copy()
             changed[index] = value
-            return qubo_objective(changed, quadratic_matrix, linear_vector)
+            return float(
+                0.5 * changed @ quadratic_matrix @ changed
+                + linear_vector @ changed
+            )
 
         selected_count = int(projected.sum())
         while selected_count > self.max_selected_features:

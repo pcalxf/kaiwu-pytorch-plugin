@@ -1,9 +1,29 @@
 from __future__ import annotations
 
+import os
+import sys
+
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+
+src_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src"))
+sys.path.insert(0, src_root)
+
+import kaiwu
+
+kaiwu_src_path = os.path.join(src_root, "kaiwu")
+if kaiwu_src_path not in kaiwu.__path__:
+    kaiwu.__path__ = [kaiwu_src_path] + list(kaiwu.__path__)
+
+for module_name in list(sys.modules):
+    if module_name == "kaiwu.torch_plugin" or module_name.startswith(
+        "kaiwu.torch_plugin."
+    ):
+        del sys.modules[module_name]
+if hasattr(kaiwu, "torch_plugin"):
+    delattr(kaiwu, "torch_plugin")
 
 from kaiwu.torch_plugin import FeatureSelectionWrapper
 from kaiwu.torch_plugin.maifs import plugin
@@ -43,17 +63,17 @@ def test_fit_weights_updates_mask_with_solver_kwargs(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
 
     def fake_solve_qubo(
-        q: np.ndarray,
-        c: np.ndarray,
-        s0: np.ndarray,
+        quadratic_matrix: np.ndarray,
+        linear_vector: np.ndarray,
+        initial_state: np.ndarray,
         solver: str,
         **solver_kwargs: object,
     ) -> np.ndarray:
         calls.append(
             {
-                "q_shape": q.shape,
-                "c_shape": c.shape,
-                "s0": s0.copy(),
+                "quadratic_shape": quadratic_matrix.shape,
+                "linear_shape": linear_vector.shape,
+                "initial_state": initial_state.copy(),
                 "solver": solver,
                 "solver_kwargs": dict(solver_kwargs),
             }
@@ -77,7 +97,7 @@ def test_fit_weights_updates_mask_with_solver_kwargs(monkeypatch) -> None:
         nn.Linear(4, 1, bias=False),
         feature_dim=4,
         solver="sa",
-        solver_kwargs={"max_iter": 7, "random_state": 3},
+        solver_kwargs={"alpha": 0.99, "size_limit": 1, "rand_seed": 3},
         mask_update_epochs=1,
     )
     loss_fn = nn.MSELoss()
@@ -87,11 +107,15 @@ def test_fit_weights_updates_mask_with_solver_kwargs(monkeypatch) -> None:
 
     assert isinstance(mean_loss, float)
     assert len(calls) == 1
-    assert calls[0]["q_shape"] == (4, 4)
-    assert calls[0]["c_shape"] == (4,)
-    assert np.array_equal(calls[0]["s0"], np.ones(4, dtype=int))
+    assert calls[0]["quadratic_shape"] == (4, 4)
+    assert calls[0]["linear_shape"] == (4,)
+    assert np.array_equal(calls[0]["initial_state"], np.ones(4, dtype=int))
     assert calls[0]["solver"] == "sa"
-    assert calls[0]["solver_kwargs"] == {"max_iter": 7, "random_state": 3}
+    assert calls[0]["solver_kwargs"] == {
+        "alpha": 0.99,
+        "size_limit": 1,
+        "rand_seed": 3,
+    }
     assert np.array_equal(selector.get_support().astype(int), np.array([1, 0, 1, 0]))
     assert selector.selected_indices().tolist() == [0, 2]
     assert selector.num_selected() == 2
