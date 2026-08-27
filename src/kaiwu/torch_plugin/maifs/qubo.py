@@ -10,7 +10,7 @@ from numbers import Integral
 from pathlib import Path
 from time import time_ns
 from typing import Any, cast
-
+import kaiwu as kw
 import numpy as np
 
 AVAILABLE_SOLVERS = (
@@ -618,12 +618,7 @@ def _solve_ising_kaiwu_cim(
         ImportError: If the optional Kaiwu package is unavailable.
         RuntimeError: If Kaiwu CIM does not return a solution.
     """
-    try:
-        import kaiwu as kw
-    except ImportError as exc:
-        raise ImportError(
-            "MAIFS solver 'kaiwu_cim' requires the optional 'kaiwu' package."
-        ) from exc
+
 
     explorer = PrecisionSplitExplorer(
         target_precision=target_precision,
