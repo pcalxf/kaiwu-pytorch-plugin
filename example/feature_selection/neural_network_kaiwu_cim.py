@@ -26,7 +26,7 @@ from feature_selection_models import SimpleLSTM, SimpleRNN, TinyCNN
 from kaiwu.torch_plugin import FeatureSelectionWrapper
 from kaiwu_license import _init_kaiwu_license_from_env
 
-KAIWU_PROJECT_NO = "26086807"
+KAIWU_PROJECT_NO = "Your PROJECT NO"
 
 
 def main() -> None:

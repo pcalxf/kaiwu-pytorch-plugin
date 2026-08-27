@@ -616,12 +616,8 @@ def _solve_ising_sa(
     resolved_kwargs.update(optimizer_kwargs)
     optimizer = kw.classical.SimulatedAnnealingOptimizer(**resolved_kwargs)
 
-    random_state_snapshot = np.random.get_state()
-    try:
-        np.random.seed(int(random_state))
-        result = optimizer.solve(matrix)
-    finally:
-        np.random.set_state(random_state_snapshot)
+    np.random.seed(int(random_state))
+    result = optimizer.solve(matrix)
 
     if result is None:
         raise RuntimeError("SimulatedAnnealingOptimizer did not return a solution.")
@@ -698,96 +694,21 @@ def _solve_ising_kaiwu_cim(
         cim_kwargs["interval"] = int(interval)
     optimizer = kw.cim.CIMOptimizer(**cim_kwargs)
 
-    try:
-        result = optimizer.solve(submit_matrix)
-        if result is None:
-            raise RuntimeError("CIMOptimizer did not return a solution.")
-        result = np.asarray(result)
-        result = result.reshape(1, -1) if result.ndim == 1 else result
-        if result.shape[0] == 0:
-            raise RuntimeError("CIMOptimizer returned no solutions.")
-        restored = explorer.restore_solution(result[0])
-        return np.asarray(restored).reshape(1, -1)
-    finally:
-        if cleanup_records:
-            for child in resolved_save_dir.iterdir():
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    try:
-                        child.unlink()
-                    except FileNotFoundError:
-                        pass
-
-
-def _optional_int(value: object) -> int | None:
-    """Convert optional solver values to integers."""
-    if value is None:
-        return None
-    return int(value)
-
-
-def _solve_ising_kaiwu_backend(
-    ising_matrix: np.ndarray,
-    solver_kwargs: dict[str, object],
-) -> np.ndarray:
-    """Solve an Ising matrix with the Kaiwu CIM backend."""
-    max_bits = solver_kwargs.get("max_bits", DEFAULT_CIM_MAX_BITS)
-    return _solve_ising_kaiwu_cim(
-        ising_matrix,
-        target_precision=int(
-            solver_kwargs.get(
-                "target_precision",
-                DEFAULT_CIM_TARGET_PRECISION,
-            )
-        ),
-        max_bits=_optional_int(max_bits),
-        max_precision=int(
-            solver_kwargs.get("max_precision", DEFAULT_CIM_MAX_PRECISION)
-        ),
-        precision_step=int(
-            solver_kwargs.get("precision_step", DEFAULT_CIM_PRECISION_STEP)
-        ),
-        sample_number=int(
-            solver_kwargs.get("sample_number", DEFAULT_CIM_SAMPLE_NUMBER)
-        ),
-        save_dir=cast(str | Path | None, solver_kwargs.get("save_dir", None)),
-        cleanup_records=bool(solver_kwargs.get("cleanup_records", True)),
-        project_no=cast(str | None, solver_kwargs.get("project_no", None)),
-        task_mode=solver_kwargs.get("task_mode", DEFAULT_CIM_TASK_MODE),
-        interval=cast(int | None, solver_kwargs.get("interval", None)),
-    )
-
-
-def _solve_ising_with_backend(
-    solver_name: str,
-    ising_matrix: np.ndarray,
-    initial_state: np.ndarray,
-    solver_kwargs: dict[str, object],
-) -> np.ndarray:
-    """Dispatch an Ising matrix to the selected solver backend."""
-    if solver_name == "local_search":
-        return _solve_ising_local_search(
-            ising_matrix,
-            initial_binary=initial_state,
-            max_iter=int(solver_kwargs.get("max_iter", 2000)),
-        )
-    if solver_name == "sa":
-        sa_kwargs = dict(solver_kwargs)
-        max_iter = int(sa_kwargs.pop("max_iter", 2000))
-        random_state = int(sa_kwargs.pop("random_state", 0))
-        return _solve_ising_sa(
-            ising_matrix,
-            initial_binary=initial_state,
-            max_iter=max_iter,
-            random_state=random_state,
-            **sa_kwargs,
-        )
-    if solver_name == "kaiwu_cim":
-        return _solve_ising_kaiwu_backend(ising_matrix, solver_kwargs)
-
-    choices = ", ".join(AVAILABLE_SOLVERS)
-    raise ValueError(f"Unsupported solver {solver_name!r}. Available solvers: {choices}")
+    result = optimizer.solve(submit_matrix)
+    if result is None:
+        raise RuntimeError("CIMOptimizer did not return a solution.")
+    result = np.asarray(result)
+    result = result.reshape(1, -1) if result.ndim == 1 else result
+    if result.shape[0] == 0:
+        raise RuntimeError("CIMOptimizer returned no solutions.")
+    restored = explorer.restore_solution(result[0])
+    if cleanup_records:
+        for child in resolved_save_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            elif child.exists():
+                child.unlink()
+    return np.asarray(restored).reshape(1, -1)
 
 
 def _binary_from_solver_solution(
@@ -852,12 +773,54 @@ def solve_qubo(
         if not np.all((initial_state == 0) | (initial_state == 1)):
             raise ValueError("initial_state must contain only binary 0/1 values")
 
-        spin_solutions = _solve_ising_with_backend(
-            solver_name,
-            ising_matrix,
-            initial_state,
-            solver_kwargs,
-        )
+        if solver_name == "local_search":
+            spin_solutions = _solve_ising_local_search(
+                ising_matrix,
+                initial_binary=initial_state,
+                max_iter=int(solver_kwargs.get("max_iter", 2000)),
+            )
+        elif solver_name == "sa":
+            sa_kwargs = dict(solver_kwargs)
+            max_iter = int(sa_kwargs.pop("max_iter", 2000))
+            random_state = int(sa_kwargs.pop("random_state", 0))
+            spin_solutions = _solve_ising_sa(
+                ising_matrix,
+                initial_binary=initial_state,
+                max_iter=max_iter,
+                random_state=random_state,
+                **sa_kwargs,
+            )
+        elif solver_name == "kaiwu_cim":
+            max_bits = solver_kwargs.get("max_bits", DEFAULT_CIM_MAX_BITS)
+            spin_solutions = _solve_ising_kaiwu_cim(
+                ising_matrix,
+                target_precision=int(
+                    solver_kwargs.get(
+                        "target_precision",
+                        DEFAULT_CIM_TARGET_PRECISION,
+                    )
+                ),
+                max_bits=None if max_bits is None else int(max_bits),
+                max_precision=int(
+                    solver_kwargs.get("max_precision", DEFAULT_CIM_MAX_PRECISION)
+                ),
+                precision_step=int(
+                    solver_kwargs.get("precision_step", DEFAULT_CIM_PRECISION_STEP)
+                ),
+                sample_number=int(
+                    solver_kwargs.get("sample_number", DEFAULT_CIM_SAMPLE_NUMBER)
+                ),
+                save_dir=cast(str | Path | None, solver_kwargs.get("save_dir", None)),
+                cleanup_records=bool(solver_kwargs.get("cleanup_records", True)),
+                project_no=cast(str | None, solver_kwargs.get("project_no", None)),
+                task_mode=solver_kwargs.get("task_mode", DEFAULT_CIM_TASK_MODE),
+                interval=cast(int | None, solver_kwargs.get("interval", None)),
+            )
+        else:
+            choices = ", ".join(AVAILABLE_SOLVERS)
+            raise ValueError(
+                f"Unsupported solver {solver_name!r}. Available solvers: {choices}"
+            )
     except (ImportError, ValueError):
         raise
     except Exception as exc:
